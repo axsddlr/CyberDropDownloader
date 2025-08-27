@@ -51,9 +51,8 @@ def limiter(func: Callable[P, Coroutine[None, None, R]]) -> Callable[P, Coroutin
             await self.client_manager.global_rate_limiter.acquire()
             await domain_limiter.acquire()
 
-            # TODO: Use a single global download session for the entire run
-            # TODO: Unify download limiter with scrape limiter # https://github.com/jbsparrow/CyberDropDownloader/issues/556
-            async with self.client_manager.new_download_session() as client:
+            # Use pooled session for memory efficiency and connection reuse
+            async with self.client_manager.get_download_session(domain) as client:
                 kwargs["client_session"] = client
                 return await func(*args, **kwargs)
 
