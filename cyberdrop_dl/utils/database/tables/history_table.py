@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import pathlib
 from sqlite3 import IntegrityError, Row
 from typing import TYPE_CHECKING
+from collections import defaultdict
 
 from cyberdrop_dl.utils.database.table_definitions import create_fixed_history, create_history
 from cyberdrop_dl.utils.utilities import log
@@ -43,10 +45,52 @@ def get_db_path(url: URL, domain: str = "") -> str:
     return url.path
 
 
+class DatabaseBatch:
+    """Batches database operations for improved performance."""
+    
+    def __init__(self, db_conn: aiosqlite.Connection, batch_size: int = 100):
+        self.db_conn = db_conn
+        self.batch_size = batch_size
+        self.operations = defaultdict(list)
+        self._lock = asyncio.Lock()
+    
+    def add_operation(self, query: str, params: tuple):
+        """Add an operation to the batch."""
+        self.operations[query].append(params)
+    
+    async def flush(self) -> None:
+        """Execute all batched operations."""
+        async with self._lock:
+            if not self.operations:
+                return
+                
+            cursor = await self.db_conn.cursor()
+            try:
+                for query, param_list in self.operations.items():
+                    if len(param_list) == 1:
+                        await cursor.execute(query, param_list[0])
+                    else:
+                        await cursor.executemany(query, param_list)
+                await self.db_conn.commit()
+                self.operations.clear()
+            except Exception as e:
+                await self.db_conn.rollback()
+                log(f"Database batch operation failed: {e}", 40, exc_info=e)
+                raise
+    
+    async def auto_flush(self) -> None:
+        """Automatically flush if batch size is reached."""
+        total_operations = sum(len(params) for params in self.operations.values())
+        if total_operations >= self.batch_size:
+            await self.flush()
+
+
 class HistoryTable:
     def __init__(self, db_conn: aiosqlite.Connection) -> None:
         self.db_conn: aiosqlite.Connection = db_conn
         self.ignore_history: bool = False
+        self.batch = DatabaseBatch(db_conn, batch_size=50)
+        self._batch_timer_task: asyncio.Task | None = None
 
     async def startup(self) -> None:
         """Startup process for the HistoryTable."""
@@ -59,6 +103,35 @@ class HistoryTable:
         await self.fix_primary_keys()
         await self.add_columns_media()
         await self.run_updates()
+        
+        # Start periodic batch flush timer
+        self._start_batch_timer()
+    
+    async def shutdown(self) -> None:
+        """Shutdown process for the HistoryTable."""
+        if self._batch_timer_task and not self._batch_timer_task.done():
+            self._batch_timer_task.cancel()
+            try:
+                await self._batch_timer_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Flush any remaining batched operations
+        await self.batch.flush()
+    
+    def _start_batch_timer(self) -> None:
+        """Start periodic timer to flush batched operations."""
+        async def timer():
+            while True:
+                try:
+                    await asyncio.sleep(2.0)  # Flush every 2 seconds
+                    await self.batch.flush()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    log(f"Batch timer error: {e}", 40, exc_info=e)
+        
+        self._batch_timer_task = asyncio.create_task(timer())
 
     async def update_previously_unsupported(self, crawlers: dict[str, Crawler]) -> None:
         """Update old `no_crawler` entries that are now supported."""
@@ -101,9 +174,11 @@ class HistoryTable:
             # Update the referer if it has changed so that check_complete_by_referer can work
             if str(referer) != sql_file_check[0] and url != referer:
                 log(f"Updating referer of {url} from {sql_file_check[0]} to {referer}")
-                query = """UPDATE media SET referer = ? WHERE domain = ? and url_path = ?"""
-                await cursor.execute(query, (str(referer), domain, url_path))
-                await self.db_conn.commit()
+                self.batch.add_operation(
+                    """UPDATE media SET referer = ? WHERE domain = ? and url_path = ?""",
+                    (str(referer), domain, url_path)
+                )
+                await self.batch.auto_flush()
 
             return True
         return False
@@ -125,11 +200,11 @@ class HistoryTable:
         """Sets an album_id in the database."""
 
         url_path = get_db_path(media_item.url, str(media_item.referer))
-        await self.db_conn.execute(
+        self.batch.add_operation(
             """UPDATE media SET album_id = ? WHERE domain = ? and url_path = ?""",
-            (media_item.album_id, domain, url_path),
+            (media_item.album_id, domain, url_path)
         )
-        await self.db_conn.commit()
+        await self.batch.auto_flush()
 
     async def check_complete_by_referer(self, domain: str | None, referer: URL) -> bool:
         """Checks whether an individual file has completed given its domain and url path."""
@@ -154,17 +229,20 @@ class HistoryTable:
 
         url_path = get_db_path(media_item.url, str(media_item.referer))
         download_filename = media_item.download_filename or ""
+        
+        # Add operations to batch instead of executing immediately
         try:
-            await self.db_conn.execute(
+            self.batch.add_operation(
                 """UPDATE media SET domain = ?, album_id = ? WHERE domain = 'no_crawler' and url_path = ? and referer = ?""",
-                (domain, media_item.album_id, url_path, str(media_item.referer)),
+                (domain, media_item.album_id, url_path, str(media_item.referer))
             )
         except IntegrityError:
-            await self.db_conn.execute(
+            self.batch.add_operation(
                 """DELETE FROM media WHERE domain = 'no_crawler' and url_path = ?""",
-                (url_path,),
+                (url_path,)
             )
-        await self.db_conn.execute(
+        
+        self.batch.add_operation(
             """INSERT OR IGNORE INTO media (domain, url_path, referer, album_id, download_path, download_filename, original_filename, completed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
             (
                 domain,
@@ -175,46 +253,48 @@ class HistoryTable:
                 download_filename,
                 media_item.original_filename,
                 0,
-            ),
-        )
-        if download_filename:
-            await self.db_conn.execute(
-                """UPDATE media SET download_filename = ? WHERE domain = ? and url_path = ?""",
-                (download_filename, domain, url_path),
             )
-        await self.db_conn.commit()
+        )
+        
+        if download_filename:
+            self.batch.add_operation(
+                """UPDATE media SET download_filename = ? WHERE domain = ? and url_path = ?""",
+                (download_filename, domain, url_path)
+            )
+        
+        await self.batch.auto_flush()
 
     async def mark_complete(self, domain: str, media_item: MediaItem) -> None:
         """Mark a download as completed in the database."""
 
         url_path = get_db_path(media_item.url, str(media_item.referer))
-        await self.db_conn.execute(
+        self.batch.add_operation(
             """UPDATE media SET completed = 1, completed_at = CURRENT_TIMESTAMP WHERE domain = ? and url_path = ?""",
-            (domain, url_path),
+            (domain, url_path)
         )
-        await self.db_conn.commit()
+        await self.batch.auto_flush()
 
     async def add_filesize(self, domain: str, media_item: MediaItem) -> None:
         """Add the file size to the db."""
 
         url_path = get_db_path(media_item.url, str(media_item.referer))
         file_size = pathlib.Path(media_item.complete_file).stat().st_size
-        await self.db_conn.execute(
+        self.batch.add_operation(
             """UPDATE media SET file_size=? WHERE domain = ? and url_path = ?""",
-            (file_size, domain, url_path),
+            (file_size, domain, url_path)
         )
-        await self.db_conn.commit()
+        await self.batch.auto_flush()
 
     async def add_duration(self, domain: str, media_item: MediaItem) -> None:
-        """Add the file size to the db."""
+        """Add the file duration to the db."""
 
         url_path = get_db_path(media_item.url, str(media_item.referer))
         duration = media_item.duration
-        await self.db_conn.execute(
+        self.batch.add_operation(
             """UPDATE media SET duration=? WHERE domain = ? and url_path = ?""",
-            (duration, domain, url_path),
+            (duration, domain, url_path)
         )
-        await self.db_conn.commit()
+        await self.batch.auto_flush()
 
     async def get_duration(self, domain: str, media_item: MediaItem) -> float | None:
         """Returns the duration from the database."""
@@ -232,9 +312,11 @@ class HistoryTable:
     async def add_download_filename(self, domain: str, media_item: MediaItem) -> None:
         """Add the download_filename to the db."""
         url_path = get_db_path(media_item.url, str(media_item.referer))
-        query = """UPDATE media SET download_filename=? WHERE domain = ? and url_path = ? and download_filename = '' """
-        await self.db_conn.execute(query, (media_item.download_filename, domain, url_path))
-        await self.db_conn.commit()
+        self.batch.add_operation(
+            """UPDATE media SET download_filename=? WHERE domain = ? and url_path = ? and download_filename = '' """,
+            (media_item.download_filename, domain, url_path)
+        )
+        await self.batch.auto_flush()
 
     async def check_filename_exists(self, filename: str) -> bool:
         """Checks whether a downloaded filename exists in the database."""

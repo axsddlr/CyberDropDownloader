@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
+import weakref
+from collections import OrderedDict
 from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Self
@@ -34,9 +37,146 @@ if TYPE_CHECKING:
     from cyberdrop_dl.crawlers import Crawler
     from cyberdrop_dl.managers.manager import Manager
 
-existing_crawlers: dict[str, Crawler] = {}
-_seen_urls: set[AbsoluteHttpURL] = set()
+class BoundedURLCache:
+    """LRU cache for URL deduplication with automatic cleanup to prevent memory leaks."""
+    
+    def __init__(self, max_size: int = 50000, cleanup_interval: int = 3600):
+        self._cache: OrderedDict[AbsoluteHttpURL, float] = OrderedDict()
+        self._max_size = max_size
+        self._cleanup_interval = cleanup_interval  # seconds
+        self._last_cleanup = time.time()
+        self._hit_count = 0
+        self._miss_count = 0
+    
+    def contains(self, url: AbsoluteHttpURL) -> bool:
+        """Check if URL has been seen before, managing cache size."""
+        current_time = time.time()
+        
+        # Periodic cleanup
+        if current_time - self._last_cleanup > self._cleanup_interval:
+            self._cleanup_old_entries(current_time)
+        
+        if url in self._cache:
+            # Move to end (most recently used)
+            self._cache.move_to_end(url)
+            self._hit_count += 1
+            return True
+        
+        # Add new URL
+        self._cache[url] = current_time
+        self._miss_count += 1
+        
+        # Enforce size limit
+        if len(self._cache) > self._max_size:
+            # Remove oldest entries (20% of cache)
+            entries_to_remove = self._max_size // 5
+            for _ in range(entries_to_remove):
+                self._cache.popitem(last=False)
+        
+        return False
+    
+    def _cleanup_old_entries(self, current_time: float) -> None:
+        """Remove entries older than 1 hour."""
+        cutoff_time = current_time - 3600  # 1 hour ago
+        to_remove = []
+        
+        for url, timestamp in self._cache.items():
+            if timestamp < cutoff_time:
+                to_remove.append(url)
+            else:
+                break  # OrderedDict, so older entries come first
+        
+        for url in to_remove:
+            del self._cache[url]
+        
+        self._last_cleanup = current_time
+        
+        if to_remove:
+            from cyberdrop_dl.utils.logger import log_debug
+            log_debug(f"URL cache cleanup removed {len(to_remove)} old entries", 15)
+    
+    def get_stats(self) -> dict[str, int | float]:
+        """Get cache statistics for monitoring."""
+        total_requests = self._hit_count + self._miss_count
+        hit_rate = self._hit_count / total_requests if total_requests > 0 else 0
+        
+        return {
+            "cache_size": len(self._cache),
+            "max_size": self._max_size,
+            "hit_count": self._hit_count,
+            "miss_count": self._miss_count,
+            "hit_rate": hit_rate,
+            "seconds_since_cleanup": int(time.time() - self._last_cleanup)
+        }
+    
+    def clear(self) -> None:
+        """Clear the cache (useful for testing/reset)."""
+        self._cache.clear()
+        self._hit_count = 0
+        self._miss_count = 0
+        self._last_cleanup = time.time()
+
+
+class CrawlerRegistry:
+    """Registry for crawler instances with weak references to prevent memory leaks."""
+    
+    def __init__(self):
+        self._crawlers: dict[str, Crawler] = {}
+        self._crawler_refs: dict[str, weakref.ref] = {}
+        self._last_cleanup = time.time()
+    
+    def get_crawlers(self) -> dict[str, Crawler]:
+        """Get crawlers dictionary, cleaning up dead references."""
+        current_time = time.time()
+        
+        # Cleanup every 5 minutes
+        if current_time - self._last_cleanup > 300:
+            self._cleanup_dead_refs()
+        
+        return self._crawlers
+    
+    def register_crawler(self, domain: str, crawler: Crawler) -> None:
+        """Register a crawler with weak reference tracking."""
+        self._crawlers[domain] = crawler
+        self._crawler_refs[domain] = weakref.ref(crawler, 
+                                                lambda ref: self._remove_dead_ref(domain))
+    
+    def _cleanup_dead_refs(self) -> None:
+        """Remove dead weak references."""
+        dead_domains = []
+        for domain, ref in self._crawler_refs.items():
+            if ref() is None:
+                dead_domains.append(domain)
+        
+        for domain in dead_domains:
+            self._crawlers.pop(domain, None)
+            self._crawler_refs.pop(domain, None)
+        
+        self._last_cleanup = time.time()
+        
+        if dead_domains:
+            from cyberdrop_dl.utils.logger import log_debug
+            log_debug(f"Crawler registry cleaned up {len(dead_domains)} dead references", 15)
+    
+    def _remove_dead_ref(self, domain: str) -> None:
+        """Callback for when a crawler is garbage collected."""
+        self._crawlers.pop(domain, None)
+        self._crawler_refs.pop(domain, None)
+    
+    def clear(self) -> None:
+        """Clear all registrations."""
+        self._crawlers.clear()
+        self._crawler_refs.clear()
+        self._last_cleanup = time.time()
+
+
+# Global instances with bounded memory usage
+_crawler_registry = CrawlerRegistry()
+_seen_urls = BoundedURLCache()
 _crawlers_disabled_at_runtime: set[str] = set()
+
+# Legacy global for backward compatibility (now points to bounded registry)
+existing_crawlers: dict[str, Crawler] = _crawler_registry.get_crawlers()
 
 
 class ScrapeMapper:
@@ -288,9 +428,8 @@ class ScrapeMapper:
         if not is_valid_url(scrape_item):
             return False
 
-        if scrape_item.url in _seen_urls:
+        if _seen_urls.contains(scrape_item.url):
             return False
-        _seen_urls.add(scrape_item.url)
 
         if is_in_domain_list(scrape_item, BLOCKED_DOMAINS):
             log(f"Skipping {scrape_item.url} as it is a blocked domain", 10)
@@ -336,6 +475,24 @@ class ScrapeMapper:
             return True
 
         return False
+
+    def get_cache_stats(self) -> dict[str, dict]:
+        """Get statistics for memory usage monitoring."""
+        return {
+            "url_cache": _seen_urls.get_stats(),
+            "crawler_registry": {
+                "active_crawlers": len(self.existing_crawlers),
+                "disabled_crawlers": len(_crawlers_disabled_at_runtime),
+            }
+        }
+
+    def force_cleanup(self) -> None:
+        """Force cleanup of all caches (useful for memory management)."""
+        _seen_urls.clear()
+        _crawler_registry.clear()
+        _crawlers_disabled_at_runtime.clear()
+        from cyberdrop_dl.utils.logger import log_debug
+        log_debug("Forced cleanup of all scrape mapper caches", 10)
 
     def disable_crawler(self, domain: str) -> Crawler | None:
         """Disables a crawler at runtime, after the scrape mapper is already running.
@@ -400,12 +557,12 @@ def get_crawlers_mapping(manager: Manager | None = None, include_generics: bool 
     from cyberdrop_dl.managers.mock_manager import MOCK_MANAGER
 
     manager_ = manager or MOCK_MANAGER
-    global existing_crawlers
-    if not existing_crawlers:
+    crawlers_dict = _crawler_registry.get_crawlers()
+    if not crawlers_dict:
         for crawler in CRAWLERS:
             crawler_instance = crawler(manager_)
-            register_crawler(existing_crawlers, crawler_instance, include_generics)
-    return existing_crawlers
+            register_crawler(crawlers_dict, crawler_instance, include_generics)
+    return crawlers_dict
 
 
 def register_crawler(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ssl
+import time
 import weakref
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -49,6 +50,142 @@ DOWNLOAD_ERROR_ETAGS = {
 }
 
 _crawler_errors: dict[str, int] = defaultdict(int)
+
+
+class AdaptiveConcurrencyManager:
+    """Intelligent concurrency management with dynamic adjustment based on system performance."""
+    
+    def __init__(self, initial_limit: int = 25, min_limit: int = 5, max_limit: int = 100):
+        self.current_limit = initial_limit
+        self.min_limit = min_limit
+        self.max_limit = max_limit
+        self.semaphore = asyncio.Semaphore(initial_limit)
+        
+        # Performance tracking
+        self.success_count = 0
+        self.error_count = 0
+        self.total_requests = 0
+        self.avg_response_time = 0.0
+        self.last_adjustment = time.time()
+        self.adjustment_interval = 30.0  # Adjust every 30 seconds
+        
+        # Error rate thresholds
+        self.error_threshold_decrease = 0.15  # Decrease limit if error rate > 15%
+        self.error_threshold_increase = 0.05  # Increase limit if error rate < 5%
+        self.response_time_threshold = 5.0    # Decrease limit if avg response > 5s
+        
+        self._lock = asyncio.Lock()
+    
+    async def acquire(self, domain: str = "default") -> None:
+        """Acquire concurrency slot with adaptive adjustment."""
+        await self.semaphore.acquire()
+        await self._maybe_adjust_limits()
+    
+    def release(self) -> None:
+        """Release concurrency slot."""
+        self.semaphore.release()
+    
+    @asynccontextmanager
+    async def limit(self, domain: str = "default"):
+        """Context manager for concurrency control."""
+        await self.acquire(domain)
+        start_time = time.time()
+        try:
+            yield
+            # Track success
+            response_time = time.time() - start_time
+            await self._record_success(response_time)
+        except Exception as e:
+            # Track error
+            await self._record_error(e)
+            raise
+        finally:
+            self.release()
+    
+    async def _record_success(self, response_time: float) -> None:
+        """Record successful request for performance tracking."""
+        async with self._lock:
+            self.success_count += 1
+            self.total_requests += 1
+            # Update rolling average response time
+            self.avg_response_time = (
+                (self.avg_response_time * (self.total_requests - 1) + response_time) / self.total_requests
+            )
+    
+    async def _record_error(self, error: Exception) -> None:
+        """Record error for performance tracking."""
+        async with self._lock:
+            self.error_count += 1
+            self.total_requests += 1
+            log_debug(f"Adaptive concurrency recorded error: {type(error).__name__}", 20)
+    
+    async def _maybe_adjust_limits(self) -> None:
+        """Adjust concurrency limits based on performance metrics."""
+        current_time = time.time()
+        if current_time - self.last_adjustment < self.adjustment_interval:
+            return
+        
+        async with self._lock:
+            if self.total_requests < 10:  # Need sufficient data
+                return
+            
+            error_rate = self.error_count / self.total_requests
+            old_limit = self.current_limit
+            
+            # Decide whether to adjust limits
+            should_decrease = (
+                error_rate > self.error_threshold_decrease or 
+                self.avg_response_time > self.response_time_threshold
+            )
+            should_increase = (
+                error_rate < self.error_threshold_increase and 
+                self.avg_response_time < 2.0 and
+                self.current_limit < self.max_limit
+            )
+            
+            if should_decrease and self.current_limit > self.min_limit:
+                self.current_limit = max(self.min_limit, int(self.current_limit * 0.8))
+                self._update_semaphore()
+                log(f"Decreased concurrency limit to {self.current_limit} (error_rate: {error_rate:.2%}, avg_time: {self.avg_response_time:.2f}s)", 20)
+                
+            elif should_increase:
+                self.current_limit = min(self.max_limit, int(self.current_limit * 1.2))
+                self._update_semaphore()
+                log(f"Increased concurrency limit to {self.current_limit} (error_rate: {error_rate:.2%}, avg_time: {self.avg_response_time:.2f}s)", 20)
+            
+            # Reset metrics for next interval
+            if old_limit != self.current_limit:
+                self.success_count = 0
+                self.error_count = 0
+                self.total_requests = 0
+                self.avg_response_time = 0.0
+            
+            self.last_adjustment = current_time
+    
+    def _update_semaphore(self) -> None:
+        """Update semaphore with new limit."""
+        # Create new semaphore with updated limit
+        current_value = self.semaphore._value
+        self.semaphore = asyncio.Semaphore(self.current_limit)
+        # Try to maintain current acquired count
+        for _ in range(min(current_value, self.current_limit)):
+            try:
+                self.semaphore.release()
+            except ValueError:
+                break
+    
+    def get_stats(self) -> dict[str, Any]:
+        """Get current performance statistics."""
+        error_rate = self.error_count / self.total_requests if self.total_requests > 0 else 0.0
+        return {
+            'current_limit': self.current_limit,
+            'total_requests': self.total_requests,
+            'success_count': self.success_count,
+            'error_count': self.error_count,
+            'error_rate': error_rate,
+            'avg_response_time': self.avg_response_time,
+            'semaphore_available': self.semaphore._value,
+        }
 
 
 class DDosGuard:
@@ -117,6 +254,14 @@ class ClientManager:
         }
 
         self.global_rate_limiter = AsyncLimiter(self.manager.global_config.rate_limiting_options.rate_limit, 1)
+        
+        # Adaptive concurrency management
+        initial_download_limit = self.manager.global_config.rate_limiting_options.max_simultaneous_downloads
+        self.adaptive_concurrency = AdaptiveConcurrencyManager(
+            initial_limit=initial_download_limit,
+            min_limit=max(5, initial_download_limit // 4),
+            max_limit=min(200, initial_download_limit * 3)
+        )
         
         # Session pooling for memory optimization
         self._shared_download_sessions: dict[str, ClientSession] = {}
@@ -317,20 +462,16 @@ class ClientManager:
                 log(msg, 40)
             raise TooManyCrawlerErrors
 
-    @contextlib.contextmanager
-    def request_context(self, domain: str) -> Generator[None]:
+    @asynccontextmanager
+    async def request_context(self, domain: str):
+        """Enhanced request context with adaptive concurrency."""
         self.check_domain_errors(domain)
-        try:
-            yield
-        except DDOSGuardError:
-            _crawler_errors[domain] += 1
-            raise
-        else:
-            # we could potencially reset the counter here
-            # _crawler_errors[domain] = 0
-            pass
-        finally:
-            pass
+        async with self.adaptive_concurrency.limit(domain):
+            try:
+                yield
+            except DDOSGuardError:
+                _crawler_errors[domain] += 1
+                raise
 
     async def load_cookie_files(self) -> None:
         if self.manager.config_manager.settings_data.browser_cookies.auto_import:

@@ -4,17 +4,19 @@ import asyncio
 import calendar
 import itertools
 import time
+from collections import defaultdict
 from functools import partial, wraps
 from http import HTTPStatus
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 import aiofiles
+import aiohttp
 from dateutil import parser
 from videoprops import get_audio_properties, get_video_properties
 
 from cyberdrop_dl.constants import FILE_FORMATS
 from cyberdrop_dl.data_structures.url_objects import AbsoluteHttpURL
-from cyberdrop_dl.exceptions import DDOSGuardError, DownloadError, InvalidContentTypeError, SlowDownloadError
+from cyberdrop_dl.exceptions import DDOSGuardError, DownloadError, InvalidContentTypeError, SlowDownloadError, ErrorLogMessage
 from cyberdrop_dl.utils.logger import log
 from cyberdrop_dl.utils.utilities import get_size_or_none
 
@@ -38,6 +40,246 @@ R = TypeVar("R")
 CONTENT_TYPES_OVERRIDES = {"text/vnd.trolltech.linguist": "video/MP2T"}
 
 
+def preserve_error_context(operation_name: str):
+    """Decorator to preserve comprehensive error context for debugging and monitoring."""
+    def decorator(func: Callable[P, Coroutine[None, None, R]]) -> Callable[P, Coroutine[None, None, R]]:
+        @wraps(func)
+        async def wrapper(*args, **kwargs) -> R:
+            media_item = None
+            domain = None
+            
+            # Extract context from arguments
+            if args:
+                self = args[0]
+                if len(args) > 1:
+                    if isinstance(args[1], str):
+                        domain = args[1]
+                    elif hasattr(args[1], 'url'):
+                        media_item = args[1]
+                if len(args) > 2 and hasattr(args[2], 'url'):
+                    media_item = args[2]
+                
+            start_time = time.time()
+            try:
+                result = await func(*args, **kwargs)
+                # Log successful operations for monitoring
+                if media_item and hasattr(media_item, 'url'):
+                    duration = time.time() - start_time
+                    log(f"{operation_name} succeeded for {media_item.url} in {duration:.2f}s", 10)
+                return result
+                
+            except Exception as e:
+                # Preserve comprehensive error context
+                duration = time.time() - start_time
+                error_context = {
+                    'operation': operation_name,
+                    'duration': f"{duration:.2f}s",
+                    'domain': domain,
+                    'url': str(media_item.url) if media_item and hasattr(media_item, 'url') else None,
+                    'filename': getattr(media_item, 'filename', None) if media_item else None,
+                    'filesize': getattr(media_item, 'filesize', None) if media_item else None,
+                    'referer': str(media_item.referer) if media_item and hasattr(media_item, 'referer') else None,
+                    'complete_file': str(media_item.complete_file) if media_item and hasattr(media_item, 'complete_file') else None,
+                    'partial_file': str(media_item.partial_file) if media_item and hasattr(media_item, 'partial_file') else None,
+                }
+                
+                # Create enhanced error message with context
+                if hasattr(e, 'ui_failure') and hasattr(e, 'message'):
+                    # This is already a CDLBaseError, enhance it
+                    enhanced_msg = f"{e.message} | Context: {error_context}"
+                    e.message = enhanced_msg
+                else:
+                    # Create new error log message with full context
+                    error_log = ErrorLogMessage.from_unknown_exc(e)
+                    log(f"{operation_name} failed: {error_log.main_log_msg} | Context: {error_context}", 40, exc_info=e)
+                
+                raise
+                
+        return wrapper
+    return decorator
+
+
+class IntelligentRetryManager:
+    """Advanced retry mechanism with exponential backoff and adaptive strategies."""
+    
+    def __init__(self, max_retries: int = 5, base_delay: float = 1.0, max_delay: float = 60.0):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.retry_stats: dict[str, dict] = defaultdict(lambda: {
+            'attempts': 0, 
+            'successes': 0, 
+            'last_retry_time': 0.0,
+            'error_types': defaultdict(int)
+        })
+    
+    def should_retry(self, error: Exception, attempt: int, domain: str) -> bool:
+        """Determine if an error should be retried based on type and context."""
+        if attempt >= self.max_retries:
+            return False
+        
+        # Errors that should be retried
+        retryable_errors = (
+            DownloadError, 
+            SlowDownloadError,
+            aiohttp.ClientError,
+            aiohttp.ServerTimeoutError,
+            aiohttp.ClientPayloadError,
+            asyncio.TimeoutError,
+        )
+        
+        # DDOSGuard and certain status codes need special handling
+        if isinstance(error, DDOSGuardError):
+            return attempt < 2  # Only retry DDOSGuard once
+            
+        if isinstance(error, DownloadError):
+            # Don't retry client errors (4xx), but retry server errors (5xx)
+            if hasattr(error, 'status'):
+                status_code = error.status
+                if isinstance(status_code, int):
+                    return status_code >= 500 or status_code == 429  # Retry server errors and rate limits
+        
+        return isinstance(error, retryable_errors)
+    
+    def calculate_delay(self, attempt: int, domain: str, error: Exception) -> float:
+        """Calculate intelligent backoff delay based on error type and domain history."""
+        base_delay = self.base_delay
+        
+        # Adjust base delay based on error type
+        if isinstance(error, DDOSGuardError):
+            base_delay = 30.0  # Longer delay for DDoS protection
+        elif isinstance(error, (aiohttp.ServerTimeoutError, asyncio.TimeoutError)):
+            base_delay = 5.0   # Medium delay for timeouts
+        elif isinstance(error, DownloadError) and hasattr(error, 'status'):
+            if error.status == 429:  # Rate limiting
+                base_delay = 10.0
+            elif error.status >= 500:  # Server errors
+                base_delay = 2.0
+        
+        # Exponential backoff with jitter
+        import random
+        exponential_delay = base_delay * (2 ** attempt)
+        jitter = random.uniform(0.1, 0.3) * exponential_delay
+        total_delay = min(exponential_delay + jitter, self.max_delay)
+        
+        # Domain-specific adjustment based on recent success rate
+        domain_stats = self.retry_stats[domain]
+        if domain_stats['attempts'] > 0:
+            success_rate = domain_stats['successes'] / domain_stats['attempts']
+            if success_rate < 0.5:  # Poor success rate, increase delays
+                total_delay *= 1.5
+        
+        return total_delay
+    
+    async def execute_with_retry(self, func, *args, domain: str = "default", **kwargs):
+        """Execute function with intelligent retry logic."""
+        last_error = None
+        
+        for attempt in range(self.max_retries + 1):
+            try:
+                # Track attempt
+                self.retry_stats[domain]['attempts'] += 1
+                
+                result = await func(*args, **kwargs)
+                
+                # Track success
+                self.retry_stats[domain]['successes'] += 1
+                
+                if attempt > 0:
+                    log(f"Retry succeeded on attempt {attempt + 1} for {domain}", 20)
+                
+                return result
+                
+            except Exception as e:
+                last_error = e
+                error_type = type(e).__name__
+                self.retry_stats[domain]['error_types'][error_type] += 1
+                
+                if not self.should_retry(e, attempt, domain):
+                    if attempt > 0:
+                        log(f"Retry failed after {attempt + 1} attempts for {domain}: {e}", 40)
+                    raise
+                
+                delay = self.calculate_delay(attempt, domain, e)
+                log(f"Retry attempt {attempt + 1}/{self.max_retries} for {domain} after {delay:.1f}s delay: {error_type}", 30)
+                
+                await asyncio.sleep(delay)
+        
+        # Should not reach here, but just in case
+        if last_error:
+            raise last_error
+    
+    def get_stats(self) -> dict:
+        """Get retry statistics for monitoring."""
+        return dict(self.retry_stats)
+
+
+# Global retry manager instance
+_retry_manager = IntelligentRetryManager()
+
+
+class AdaptiveContentStreamer:
+    """Memory-efficient content streaming with adaptive chunk sizing."""
+    
+    def __init__(self, media_item: MediaItem, content: aiohttp.StreamReader, initial_chunk_size: int = 65536):
+        self.media_item = media_item
+        self.content = content
+        self.initial_chunk_size = initial_chunk_size
+        self.current_chunk_size = initial_chunk_size
+        self.min_chunk_size = 8192    # 8KB minimum
+        self.max_chunk_size = 1048576 # 1MB maximum
+        
+        # Performance tracking
+        self.bytes_read = 0
+        self.chunks_processed = 0
+        self.start_time = time.time()
+        self.last_speed_check = time.time()
+        
+    async def stream_chunks(self):
+        """Stream content with adaptive chunk sizing based on performance."""
+        async for chunk in self.content.iter_chunked(self.current_chunk_size):
+            if not chunk:
+                break
+                
+            self.bytes_read += len(chunk)
+            self.chunks_processed += 1
+            
+            # Adapt chunk size every 10 chunks
+            if self.chunks_processed % 10 == 0:
+                await self._adapt_chunk_size()
+            
+            yield chunk
+    
+    async def _adapt_chunk_size(self):
+        """Dynamically adjust chunk size based on download performance."""
+        current_time = time.time()
+        
+        # Calculate current speed
+        time_elapsed = current_time - self.last_speed_check
+        if time_elapsed > 0:
+            current_speed = self.bytes_read / time_elapsed  # bytes per second
+            
+            # Adjust chunk size based on speed
+            if current_speed > 1_000_000:  # > 1MB/s, increase chunk size
+                self.current_chunk_size = min(self.max_chunk_size, int(self.current_chunk_size * 1.2))
+            elif current_speed < 100_000:  # < 100KB/s, decrease chunk size
+                self.current_chunk_size = max(self.min_chunk_size, int(self.current_chunk_size * 0.8))
+            
+            # Reset for next measurement
+            self.last_speed_check = current_time
+            self.bytes_read = 0
+
+
+def with_intelligent_retry(domain: str = "default"):
+    """Decorator to add intelligent retry logic to functions."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            return await _retry_manager.execute_with_retry(func, *args, domain=domain, **kwargs)
+        return wrapper
+    return decorator
+
+
 def limiter(func: Callable[P, Coroutine[None, None, R]]) -> Callable[P, Coroutine[None, None, R]]:
     """Wrapper handles limits for download session."""
 
@@ -45,7 +287,7 @@ def limiter(func: Callable[P, Coroutine[None, None, R]]) -> Callable[P, Coroutin
     async def wrapper(*args, **kwargs) -> R:
         self: DownloadClient = args[0]
         domain: str = args[1]
-        with self.client_manager.request_context(domain):
+        async with self.client_manager.request_context(domain):
             domain_limiter = await self.client_manager.get_rate_limiter(domain)
             await asyncio.sleep(await self.client_manager.get_downloader_spacer(domain))
             await self.client_manager.global_rate_limiter.acquire()
@@ -138,6 +380,8 @@ class DownloadClient:
         return download_headers
 
     @limiter
+    @preserve_error_context("file_download")
+    @with_intelligent_retry()
     async def _download(
         self,
         domain: str,
@@ -261,28 +505,61 @@ class DownloadClient:
                     continue
                 raise
 
+    @preserve_error_context("content_append")
     async def _append_content(
         self,
         media_item: MediaItem,
         content: aiohttp.StreamReader,
         update_progress: partial,
     ) -> None:
-        """Appends content to a file."""
+        """Memory-efficient content streaming with adaptive chunk sizing and buffered I/O."""
 
         check_free_space = self.make_free_space_checker(media_item)
         check_download_speed = self.make_speed_checker(media_item)
         await check_free_space()
         await self._pre_download_check(media_item)
 
+        # Create adaptive streamer for intelligent chunk sizing
+        adaptive_streamer = AdaptiveContentStreamer(media_item, content, self.chunk_size)
+        
+        # Use memory-efficient streaming with write buffering
+        write_buffer = bytearray()
+        buffer_size_limit = 512 * 1024  # 512KB buffer for optimal I/O
+        total_written = 0
+
         async with aiofiles.open(media_item.partial_file, mode="ab") as f:  # type: ignore
-            async for chunk in content.iter_chunked(self.chunk_size):
+            async for chunk in adaptive_streamer.stream_chunks():
                 await self.manager.states.RUNNING.wait()
                 await check_free_space()
+                
                 chunk_size = len(chunk)
                 await self.client_manager.speed_limiter.acquire(chunk_size)
-                await f.write(chunk)
-                update_progress(chunk_size)
+                
+                # Buffer chunks for more efficient disk I/O
+                write_buffer.extend(chunk)
+                
+                # Flush buffer when it's full or for small files (< 10MB)
+                should_flush = (
+                    len(write_buffer) >= buffer_size_limit or
+                    (media_item.filesize and media_item.filesize < 10_000_000 and len(write_buffer) >= chunk_size * 5)
+                )
+                
+                if should_flush:
+                    await f.write(write_buffer)
+                    await f.fsync()  # Force write to disk
+                    written_size = len(write_buffer)
+                    total_written += written_size
+                    update_progress(written_size)
+                    write_buffer.clear()
+                
                 check_download_speed()
+            
+            # Flush any remaining buffered data
+            if write_buffer:
+                await f.write(write_buffer)
+                await f.fsync()
+                update_progress(len(write_buffer))
+                total_written += len(write_buffer)
 
         self._post_download_check(media_item, content)
 
@@ -328,6 +605,7 @@ class DownloadClient:
 
         return check_download_speed
 
+    @preserve_error_context("download_file_orchestration")
     async def download_file(self, manager: Manager, domain: str, media_item: MediaItem) -> bool:
         """Starts a file."""
         if (
@@ -366,12 +644,14 @@ class DownloadClient:
 
     """~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"""
 
+    @preserve_error_context("mark_incomplete")
     async def mark_incomplete(self, media_item: MediaItem, domain: str) -> None:
         """Marks the media item as incomplete in the database."""
         if media_item.is_segment:
             return
         await self.manager.db_manager.history_table.insert_incompleted(domain, media_item)
 
+    @preserve_error_context("process_completed")
     async def process_completed(self, media_item: MediaItem, domain: str) -> None:
         """Marks the media item as completed in the database and adds to the completed list."""
         await self.mark_completed(domain, media_item)
@@ -380,12 +660,14 @@ class DownloadClient:
     async def mark_completed(self, domain: str, media_item: MediaItem) -> None:
         await self.manager.db_manager.history_table.mark_complete(domain, media_item)
 
+    @preserve_error_context("add_file_size")
     async def add_file_size(self, domain: str, media_item: MediaItem) -> None:
         if not media_item.complete_file:
             media_item.complete_file = self.get_file_location(media_item)
         if await asyncio.to_thread(media_item.complete_file.is_file):
             await self.manager.db_manager.history_table.add_filesize(domain, media_item)
 
+    @preserve_error_context("handle_media_completion")
     async def handle_media_item_completion(self, media_item: MediaItem, downloaded: bool = False) -> None:
         """Sends to hash client to handle hashing and marks as completed/current download."""
         try:
