@@ -76,7 +76,7 @@ class Selectors:
 
 _SELECTORS = Selectors()
 VIDEO_AND_IMAGE_EXTS: set[str] = FILE_FORMATS["Images"] | FILE_FORMATS["Videos"]
-HOST_OPTIONS: set[str] = {"bunkr.site", "bunkr.cr", "bunkr.ph"}
+HOST_OPTIONS: set[str] = {"bunkr.site", "bunkr.cr", "bunkr.ph", "bunkr.black"}
 known_bad_hosts: set[str] = set()
 
 
@@ -137,6 +137,10 @@ class BunkrrCrawler(Crawler):
             return AbsoluteHttpURL(f"https://{self.known_good_host}")
 
     async def fetch(self, scrape_item: ScrapeItem) -> None:
+        # Rewrite bunkr.black URLs to bunkr.cr
+        if scrape_item.url.host == "bunkr.black":
+            scrape_item.url = scrape_item.url.with_host("bunkr.cr")
+            
         if is_reinforced_link(scrape_item.url):  #  get.bunkr.su/file/<file_id>
             return await self.reinforced_file(scrape_item)
         if "a" in scrape_item.url.parts:  #  bunkr.site/a/<album_id>
@@ -328,6 +332,10 @@ class BunkrrCrawler(Crawler):
         """Overrides URL in host if we know a valid host.
 
         If we don't know a valid host but the response was successful, register the host as a valid host"""
+        
+        # Rewrite bunkr.black URLs to bunkr.cr
+        if url.host == "bunkr.black":
+            url = url.with_host("bunkr.cr")
 
         async def get_soup(url: AbsoluteHttpURL) -> BeautifulSoup:
             async with self.request_limiter:
