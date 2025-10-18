@@ -78,7 +78,7 @@ class Selectors:
 
 _SELECTORS = Selectors()
 VIDEO_AND_IMAGE_EXTS: set[str] = FILE_FORMATS["Images"] | FILE_FORMATS["Videos"]
-HOST_OPTIONS: set[str] = {"bunkr.site", "bunkr.cr", "bunkr.ph"}
+HOST_OPTIONS: set[str] = {"bunkr.site", "bunkr.cr", "bunkr.ph", "bunkr.black"}
 known_bad_hosts: set[str] = set()
 
 
@@ -135,6 +135,10 @@ class BunkrrCrawler(Crawler):
         self.known_good_url: AbsoluteHttpURL | None = None
 
     async def fetch(self, scrape_item: ScrapeItem) -> None:
+        # Rewrite bunkr.black URLs to bunkr.cr
+        if scrape_item.url.host == "bunkr.black":
+            scrape_item.url = scrape_item.url.with_host("bunkr.cr")
+
         if is_reinforced_link(scrape_item.url):  #  get.bunkr.su/file/<file_id>
             return await self.reinforced_file(scrape_item)
         if "a" in scrape_item.url.parts:  #  bunkr.site/a/<album_id>
@@ -345,6 +349,10 @@ class BunkrrCrawler(Crawler):
         We retry with a new host until we find one that's not DNS blocked nor DDoS-Guard protected
 
         If we find one, keep a reference to it and use it for all future requests"""
+
+        # Rewrite bunkr.black URLs to bunkr.cr
+        if url.host == "bunkr.black":
+            url = url.with_host("bunkr.cr")
 
         if not is_root_domain(url):
             return await self.request_soup(url)
