@@ -7,6 +7,7 @@ import time
 import weakref
 from base64 import b64encode
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Literal, Self, overload
 
@@ -196,6 +197,14 @@ class ClientManager:
         self.rate_limits: dict[str, AsyncLimiter] = {}
         self.download_slots: dict[str, int] = {}
         self.global_rate_limiter = AsyncLimiter(self.rate_limiting_options.rate_limit, 1)
+
+        # Session pooling for memory optimization
+        self._shared_download_sessions: dict[str, aiohttp.ClientSession] = {}
+        self._session_usage_count: dict[str, int] = defaultdict(int)
+        self._max_sessions = 3  # Maximum number of pooled sessions
+        self._session_reuse_limit = 1000  # Max requests per session before refresh
+        self._session_lock = asyncio.Lock()
+
         self.global_download_slots = asyncio.Semaphore(self.rate_limiting_options.max_simultaneous_downloads)
         self.scraper_client = ScraperClient(self)
         self.speed_limiter = DownloadSpeedLimiter(self.rate_limiting_options.download_speed_limit)
@@ -320,6 +329,106 @@ class ClientManager:
     def new_download_session(self) -> ClientSession:
         trace_configs = _create_request_log_hooks("download")
         return self._new_session(cached=False, trace_configs=trace_configs)
+
+    async def _get_or_create_pooled_session(self, session_key: str) -> aiohttp.ClientSession:
+        """Get or create a pooled download session for reuse."""
+        async with self._session_lock:
+            # Check if we have a usable session
+            if session_key in self._shared_download_sessions:
+                session = self._shared_download_sessions[session_key]
+                usage_count = self._session_usage_count[session_key]
+
+                # Check if session is still usable
+                if not session.closed and usage_count < self._session_reuse_limit:
+                    self._session_usage_count[session_key] += 1
+                    return session
+                # Session exceeded limit or closed, remove it
+                if not session.closed:
+                    await session.close()
+                del self._shared_download_sessions[session_key]
+                del self._session_usage_count[session_key]
+
+            # Clean up old sessions if we're at the limit
+            if len(self._shared_download_sessions) >= self._max_sessions:
+                # Remove the session with the highest usage count
+                oldest_key = max(self._session_usage_count.keys(), key=lambda k: self._session_usage_count[k])
+                old_session = self._shared_download_sessions[oldest_key]
+                if not old_session.closed:
+                    await old_session.close()
+                del self._shared_download_sessions[oldest_key]
+                del self._session_usage_count[oldest_key]
+
+            # Create new session with optimized settings
+            trace_configs = _create_request_log_hooks("download")
+            session = self._new_optimized_session(trace_configs)
+
+            self._shared_download_sessions[session_key] = session
+            self._session_usage_count[session_key] = 1
+
+            return session
+
+    def _new_optimized_session(
+        self, trace_configs: list[aiohttp.TraceConfig] | None = None
+    ) -> aiohttp.ClientSession:
+        """Create a new session with optimized connection pooling settings."""
+        timeout = self.rate_limiting_options._aiohttp_timeout
+
+        return aiohttp.ClientSession(
+            headers=self._default_headers,
+            raise_for_status=False,
+            cookie_jar=self.cookies,
+            timeout=timeout,
+            trace_configs=trace_configs,
+            proxy=self.manager.global_config.general.proxy,
+            connector=self._new_optimized_tcp_connector(),
+        )
+
+    def _new_optimized_tcp_connector(self) -> aiohttp.TCPConnector:
+        """Create an optimized TCP connector with connection pooling."""
+        assert constants.DNS_RESOLVER is not None
+
+        # Optimized connector settings for memory efficiency
+        conn = aiohttp.TCPConnector(
+            ssl=self.ssl_context,
+            resolver=constants.DNS_RESOLVER(),
+            limit=100,  # Total connection limit
+            limit_per_host=20,  # Per-host connection limit
+            ttl_dns_cache=300,  # DNS cache TTL (5 minutes)
+            use_dns_cache=True,
+            keepalive_timeout=30,  # Keep connections alive for 30 seconds
+            enable_cleanup_closed=True,  # Clean up closed connections
+        )
+        conn._resolver_owner = True
+        return conn
+
+    @asynccontextmanager
+    async def get_download_session(self, domain: str = "default"):
+        """Get a reusable download session with connection pooling (context manager)."""
+        session_key = f"download_{domain}" if domain != "default" else "download_default"
+        session = await self._get_or_create_pooled_session(session_key)
+        try:
+            yield session
+        finally:
+            # Session remains in pool for reuse
+            pass
+
+    async def close_all_sessions(self) -> None:
+        """Close all pooled sessions (call during cleanup)."""
+        async with self._session_lock:
+            for session in self._shared_download_sessions.values():
+                if not session.closed:
+                    await session.close()
+            self._shared_download_sessions.clear()
+            self._session_usage_count.clear()
+
+    def get_session_pool_stats(self) -> dict[str, int]:
+        """Get statistics about session pool usage."""
+        return {
+            "active_sessions": len(self._shared_download_sessions),
+            "max_sessions": self._max_sessions,
+            "total_requests": sum(self._session_usage_count.values()),
+            "reuse_limit": self._session_reuse_limit,
+        }
 
     @overload
     def _new_session(
@@ -529,6 +638,7 @@ class ClientManager:
         return min_audio_duration <= media_item.duration <= max_audio_duration
 
     async def close(self) -> None:
+        await self.close_all_sessions()  # Clean up session pools
         await self.flaresolverr.close()
 
 

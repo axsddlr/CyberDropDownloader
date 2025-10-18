@@ -153,10 +153,11 @@ class DownloadClient:
             await self._append_content(media_item, resp.content)
             return True
 
-        return await self._request_download(media_item, download_headers, process_response)
+        return await self._request_download(domain, media_item, download_headers, process_response)
 
     async def _request_download(
         self,
+        domain: str,
         media_item: MediaItem,
         download_headers: dict[str, str],
         process_response: Callable[[aiohttp.ClientResponse], Coroutine[None, None, bool]],
@@ -168,8 +169,10 @@ class DownloadClient:
         while True:
             resp = None
             try:
-                async with self.client_manager._download_session.get(download_url, headers=download_headers) as resp:
-                    return await process_response(resp)
+                # Use pooled session for memory efficiency and connection reuse
+                async with self.client_manager.get_download_session(domain) as session:
+                    async with session.get(download_url, headers=download_headers) as resp:
+                        return await process_response(resp)
             except (DownloadError, DDOSGuardError):
                 if resp is None:
                     raise
