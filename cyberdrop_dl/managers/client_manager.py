@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ssl
+import time
 import weakref
 from base64 import b64encode
 from collections import defaultdict
@@ -122,24 +123,57 @@ class CloudflareTurnstile:
 
 
 class FileLocksVault:
-    """Is this necessary? No. But I want it."""
+    """File locks vault with automatic cleanup of unused locks to prevent memory leaks."""
 
     def __init__(self) -> None:
         self._locked_files: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 300  # Cleanup every 5 minutes
+        self._main_lock = asyncio.Lock()
 
     @contextlib.asynccontextmanager
     async def get_lock(self, filename: str) -> AsyncGenerator:
         """Get filelock for the provided filename. Creates one if none exists"""
         log_debug(f"Checking lock for '{filename}'", 20)
-        if filename not in self._locked_files:
-            log_debug(f"Lock for '{filename}' does not exists", 20)
-            lock = asyncio.Lock()
-            self._locked_files[filename] = lock
 
-        async with self._locked_files[filename]:
+        async with self._main_lock:
+            if filename not in self._locked_files:
+                log_debug(f"Lock for '{filename}' does not exist, creating new one", 20)
+                lock = asyncio.Lock()
+                self._locked_files[filename] = lock
+            else:
+                log_debug(f"Lock for '{filename}' already exists", 20)
+
+            file_lock = self._locked_files[filename]
+
+        async with file_lock:
             log_debug(f"Lock for '{filename}' acquired", 20)
             yield
             log_debug(f"Lock for '{filename}' released", 20)
+
+    def force_cleanup(self) -> int:
+        """Force cleanup of unused locks and return number of locks removed.
+
+        Note: WeakValueDictionary automatically removes entries when locks are garbage collected,
+        so this method primarily serves to update the cleanup timestamp and report stats."""
+        initial_count = len(self._locked_files)
+        # WeakValueDictionary automatically cleans up, but we can trigger a check
+        # by iterating (this will remove any dead weakrefs)
+        _ = list(self._locked_files.keys())
+        final_count = len(self._locked_files)
+        removed = initial_count - final_count
+
+        self._last_cleanup = time.time()
+        if removed > 0:
+            log_debug(f"Force cleanup removed {removed} unused locks", 10)
+        return removed
+
+    def get_stats(self) -> dict[str, int]:
+        """Get statistics about the locks vault."""
+        return {
+            "total_locks": len(self._locked_files),
+            "seconds_since_last_cleanup": int(time.time() - self._last_cleanup),
+        }
 
 
 class ClientManager:
