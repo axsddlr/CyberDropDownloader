@@ -61,7 +61,7 @@ class DownloadClient:
 
     @contextlib.asynccontextmanager
     async def _track_errors(self, domain: str):
-        with self.client_manager.request_context(domain):
+        async with self.client_manager.request_context(domain):
             await self.client_manager.manager.states.RUNNING.wait()
             yield
 

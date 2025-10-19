@@ -66,8 +66,6 @@ _DOWNLOAD_ERROR_ETAGS = {
     "5a56b09d-1485eb": "eFukt Video removed",
 }
 
-_crawler_errors: dict[str, int] = defaultdict(int)
-
 
 if TYPE_CHECKING:
     from cyberdrop_dl.managers.manager import Manager
@@ -197,6 +195,10 @@ class ClientManager:
         self.rate_limits: dict[str, AsyncLimiter] = {}
         self.download_slots: dict[str, int] = {}
         self.global_rate_limiter = AsyncLimiter(self.rate_limiting_options.rate_limit, 1)
+
+        # Crawler error tracking with thread-safe access
+        self._crawler_errors: dict[str, int] = defaultdict(int)
+        self._crawler_errors_lock = asyncio.Lock()
 
         # Session pooling for memory optimization
         self._shared_download_sessions: dict[str, aiohttp.ClientSession] = {}
@@ -468,8 +470,24 @@ class ClientManager:
         conn._resolver_owner = True
         return conn
 
-    def check_domain_errors(self, domain: str) -> None:
-        if _crawler_errors[domain] >= env.MAX_CRAWLER_ERRORS:
+    async def increment_crawler_error(self, domain: str) -> None:
+        """Thread-safe increment of crawler error count for a domain."""
+        async with self._crawler_errors_lock:
+            self._crawler_errors[domain] += 1
+
+    async def get_crawler_error_count(self, domain: str) -> int:
+        """Thread-safe retrieval of crawler error count for a domain."""
+        async with self._crawler_errors_lock:
+            return self._crawler_errors[domain]
+
+    async def reset_crawler_errors(self, domain: str) -> None:
+        """Thread-safe reset of crawler error count for a domain."""
+        async with self._crawler_errors_lock:
+            self._crawler_errors[domain] = 0
+
+    async def check_domain_errors(self, domain: str) -> None:
+        error_count = await self.get_crawler_error_count(domain)
+        if error_count >= env.MAX_CRAWLER_ERRORS:
             if crawler := self.manager.scrape_mapper.disable_crawler(domain):
                 msg = (
                     f"{crawler.__class__.__name__} has been disabled after too many errors. "
@@ -478,17 +496,17 @@ class ClientManager:
                 log(msg, 40)
             raise TooManyCrawlerErrors
 
-    @contextlib.contextmanager
-    def request_context(self, domain: str) -> Generator[None]:
-        self.check_domain_errors(domain)
+    @contextlib.asynccontextmanager
+    async def request_context(self, domain: str) -> AsyncGenerator[None]:
+        await self.check_domain_errors(domain)
         try:
             yield
         except DDOSGuardError:
-            _crawler_errors[domain] += 1
+            await self.increment_crawler_error(domain)
             raise
         else:
             # we could potentially reset the counter here
-            # _crawler_errors[domain] = 0
+            # await self.reset_crawler_errors(domain)
             pass
         finally:
             pass
