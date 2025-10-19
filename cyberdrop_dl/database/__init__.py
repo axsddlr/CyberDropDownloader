@@ -28,7 +28,7 @@ class DBConnectionPool:
 
     async def _create_connection(self) -> aiosqlite.Connection:
         """Create a new database connection with optimized settings."""
-        conn = await aiosqlite.connect(self._db_path)
+        conn = await aiosqlite.connect(self._db_path, timeout=30.0)  # Increased timeout for locks
 
         # Optimize SQLite settings for concurrent access
         await conn.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging
@@ -36,6 +36,7 @@ class DBConnectionPool:
         await conn.execute("PRAGMA cache_size=10000")  # Increase cache
         await conn.execute("PRAGMA temp_store=memory")  # Use memory for temp tables
         await conn.execute("PRAGMA mmap_size=268435456")  # 256MB memory mapped I/O
+        await conn.execute("PRAGMA busy_timeout=30000")  # 30 second busy timeout
 
         return conn
 
@@ -130,8 +131,10 @@ class Database:
     async def startup(self) -> None:
         """Startup process for the DBManager."""
         # Initialize both single connection (for compatibility) and connection pool
-        self._db_conn = await aiosqlite.connect(self._db_path)
+        self._db_conn = await aiosqlite.connect(self._db_path, timeout=30.0)
         self._db_conn.row_factory = aiosqlite.Row
+        # Set busy timeout for the main connection too
+        await self._db_conn.execute("PRAGMA busy_timeout=30000")
         self._connection_pool = DBConnectionPool(self._db_path, pool_size=5)
         await self._connection_pool.initialize()
 
@@ -177,29 +180,55 @@ class Database:
 
     async def execute_read_query(self, query: str, params: tuple = ()) -> list:
         """Execute a read query using connection pool for better performance."""
-        async with self._connection_pool.get_read_connection() as conn:
-            cursor = await conn.cursor()
-            await cursor.execute(query, params)
-            return await cursor.fetchall()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connection_pool.get_read_connection() as conn:
+                    cursor = await conn.cursor()
+                    await cursor.execute(query, params)
+                    return await cursor.fetchall()
+            except Exception as e:
+                if attempt < max_retries - 1 and "database is locked" in str(e).lower():
+                    await asyncio.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                    continue
+                raise
 
     async def execute_write_query(self, query: str, params: tuple = ()) -> None:
         """Execute a write query using connection pool for better performance."""
-        async with self._connection_pool.get_write_connection() as conn:
-            cursor = await conn.cursor()
-            await cursor.execute(query, params)
-            await conn.commit()
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                async with self._connection_pool.get_write_connection() as conn:
+                    cursor = await conn.cursor()
+                    await cursor.execute(query, params)
+                    await conn.commit()
+                    return
+            except Exception as e:
+                if attempt < max_retries - 1 and "database is locked" in str(e).lower():
+                    await asyncio.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                    continue
+                raise
 
     async def execute_batch_writes(self, queries: list[tuple[str, tuple]]) -> None:
         """Execute multiple write queries in a single transaction for better performance."""
-        async with self._connection_pool.get_write_connection() as conn:
-            cursor = await conn.cursor()
+        max_retries = 5
+        for attempt in range(max_retries):
             try:
-                await conn.execute("BEGIN TRANSACTION")
-                for query, params in queries:
-                    await cursor.execute(query, params)
-                await conn.commit()
-            except Exception:
-                await conn.rollback()
+                async with self._connection_pool.get_write_connection() as conn:
+                    cursor = await conn.cursor()
+                    try:
+                        await conn.execute("BEGIN IMMEDIATE")  # Use IMMEDIATE to avoid lock escalation
+                        for query, params in queries:
+                            await cursor.execute(query, params)
+                        await conn.commit()
+                        return
+                    except Exception:
+                        await conn.rollback()
+                        raise
+            except Exception as e:
+                if attempt < max_retries - 1 and "database is locked" in str(e).lower():
+                    await asyncio.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                    continue
                 raise
 
 
