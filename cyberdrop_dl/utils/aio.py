@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import os
 import pathlib
-from stat import S_ISREG
+from stat import S_ISDIR, S_ISREG
 from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast
+
+try:
+    import aiofiles.os
+    _HAS_AIOFILES = True
+except ImportError:
+    _HAS_AIOFILES = False
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Sequence
@@ -44,23 +51,75 @@ async def gather(coros: Sequence[Awaitable[_T]], batch_size: int = 10) -> list[_
 
 
 async def stat(path: pathlib.Path):
+    """Get file status asynchronously.
+
+    Uses aiofiles.os.stat if available to avoid thread pool exhaustion,
+    falls back to asyncio.to_thread otherwise.
+    """
+    if _HAS_AIOFILES:
+        return await aiofiles.os.stat(path)
     return await asyncio.to_thread(path.stat)
 
 
 async def is_dir(path: pathlib.Path) -> bool:
+    """Check if path is a directory asynchronously.
+
+    Uses aiofiles.os.path.isdir if available to avoid thread pool exhaustion,
+    falls back to asyncio.to_thread otherwise.
+    """
+    if _HAS_AIOFILES:
+        try:
+            stat_result = await aiofiles.os.stat(path)
+            return S_ISDIR(stat_result.st_mode)
+        except (FileNotFoundError, OSError):
+            return False
     return await asyncio.to_thread(path.is_dir)
 
 
 async def is_file(path: pathlib.Path) -> bool:
+    """Check if path is a file asynchronously.
+
+    Uses aiofiles.os.path.isfile if available to avoid thread pool exhaustion,
+    falls back to asyncio.to_thread otherwise.
+    """
+    if _HAS_AIOFILES:
+        try:
+            stat_result = await aiofiles.os.stat(path)
+            return S_ISREG(stat_result.st_mode)
+        except (FileNotFoundError, OSError):
+            return False
     return await asyncio.to_thread(path.is_file)
 
 
 async def exists(path: pathlib.Path) -> bool:
+    """Check if path exists asynchronously.
+
+    Uses aiofiles.os.path.exists if available to avoid thread pool exhaustion,
+    falls back to asyncio.to_thread otherwise.
+    """
+    if _HAS_AIOFILES:
+        try:
+            await aiofiles.os.stat(path)
+            return True
+        except (FileNotFoundError, OSError):
+            return False
     return await asyncio.to_thread(path.exists)
 
 
 async def unlink(path: pathlib.Path, missing_ok: bool = False) -> None:
-    return await asyncio.to_thread(path.unlink, missing_ok)
+    """Delete file asynchronously.
+
+    Uses aiofiles.os.unlink if available to avoid thread pool exhaustion,
+    falls back to asyncio.to_thread otherwise.
+    """
+    if _HAS_AIOFILES:
+        try:
+            await aiofiles.os.unlink(path)
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+    else:
+        await asyncio.to_thread(path.unlink, missing_ok)
 
 
 async def get_size(path: pathlib.Path) -> int | None:
@@ -79,3 +138,63 @@ async def get_size(path: pathlib.Path) -> int | None:
     else:
         if S_ISREG(stat_result.st_mode):
             return stat_result.st_size
+
+
+async def rename(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """Rename/move file asynchronously.
+
+    Uses aiofiles.os.rename if available to avoid thread pool exhaustion,
+    falls back to asyncio.to_thread otherwise.
+    """
+    if _HAS_AIOFILES:
+        await aiofiles.os.rename(src, dst)
+    else:
+        await asyncio.to_thread(src.rename, dst)
+
+
+async def chmod(path: pathlib.Path, mode: int) -> None:
+    """Change file permissions asynchronously.
+
+    Uses aiofiles.os.chmod if available to avoid thread pool exhaustion,
+    falls back to asyncio.to_thread otherwise.
+    """
+    if _HAS_AIOFILES:
+        await aiofiles.os.chmod(path, mode)
+    else:
+        await asyncio.to_thread(pathlib.Path.chmod, path, mode)
+
+
+async def utime(path: pathlib.Path, times: tuple[float, float] | None = None) -> None:
+    """Set file access and modification times asynchronously.
+
+    Uses aiofiles.os.utime if available to avoid thread pool exhaustion,
+    falls back to asyncio.to_thread otherwise.
+
+    Args:
+        path: Path to file
+        times: Tuple of (atime, mtime) in seconds since epoch, or None for current time
+    """
+    if _HAS_AIOFILES:
+        await aiofiles.os.utime(path, times)
+    else:
+        await asyncio.to_thread(os.utime, path, times)
+
+
+async def makedirs(path: pathlib.Path, mode: int = 0o777, exist_ok: bool = False) -> None:
+    """Create directory recursively asynchronously.
+
+    Uses aiofiles.os.makedirs if available to avoid thread pool exhaustion,
+    falls back to asyncio.to_thread otherwise.
+    """
+    if _HAS_AIOFILES:
+        await aiofiles.os.makedirs(path, mode, exist_ok=exist_ok)
+    else:
+        await asyncio.to_thread(path.mkdir, parents=True, exist_ok=exist_ok, mode=mode)
+
+
+async def resolve(path: pathlib.Path) -> pathlib.Path:
+    """Resolve path to absolute path asynchronously.
+
+    Falls back to asyncio.to_thread since aiofiles doesn't provide this.
+    """
+    return await asyncio.to_thread(path.resolve)

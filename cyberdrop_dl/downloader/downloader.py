@@ -191,7 +191,7 @@ class Downloader:
         media_item.set_task_id(task_id)
         video, audio, _subs = await self._download_rendition_group(media_item, m3u8_group)
         if not audio:
-            await asyncio.to_thread(video.rename, media_item.complete_file)
+            await aio.rename(video, media_item.complete_file)
         else:
             # TODO: add remux method to ffmpeg to create an mkv file instead of mp4
             # Subtitles format may be incompatible with mp4 and they will be silently dropped by ffmpeg
@@ -219,7 +219,7 @@ class Downloader:
                 suffix = media_item.complete_file.suffix + Path(m3u8.segments[0].absolute_uri).suffix
 
             output = media_item.complete_file.with_suffix(suffix)
-            if await asyncio.to_thread(output.is_file):
+            if await aio.is_file(output):
                 return output
 
             batch_size = _VIDEO_HLS_BATCH_SIZE if m3u8.media_type == "video" else _AUDIO_HLS_BATCH_SIZE
@@ -237,7 +237,7 @@ class Downloader:
                 if not ffmpeg_result.success:
                     raise DownloadError("FFmpeg Concat Error", ffmpeg_result.stderr, media_item)
             else:
-                await asyncio.to_thread(seg_paths[0].rename, output)
+                await aio.rename(seg_paths[0], output)
             return output
 
         audio = subtitles = None
@@ -294,7 +294,7 @@ class Downloader:
 
     async def finalize_download(self, media_item: MediaItem, downloaded: bool) -> None:
         if downloaded:
-            await asyncio.to_thread(Path.chmod, media_item.complete_file, 0o666)
+            await aio.chmod(media_item.complete_file, 0o666)
             await self.set_file_datetime(media_item, media_item.complete_file)
         self.attempt_task_removal(media_item)
         self.manager.progress_manager.download_progress.add_completed()
@@ -373,7 +373,7 @@ class Downloader:
 
         # 2. try setting modification and access date
         try:
-            await asyncio.to_thread(os.utime, complete_file, (media_item.datetime, media_item.datetime))
+            await aio.utime(complete_file, (media_item.datetime, media_item.datetime))
         except OSError:
             pass
 
@@ -419,7 +419,7 @@ class Downloader:
                 await self.check_file_can_download(media_item)
             downloaded = await self.client.download_file(self.domain, media_item)
             if downloaded:
-                await asyncio.to_thread(Path.chmod, media_item.complete_file, 0o666)
+                await aio.chmod(media_item.complete_file, 0o666)
                 if not media_item.is_segment:
                     await self.set_file_datetime(media_item, media_item.complete_file)
                     self.attempt_task_removal(media_item)

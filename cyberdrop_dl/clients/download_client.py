@@ -13,6 +13,7 @@ import aiofiles
 from cyberdrop_dl.constants import FILE_FORMATS
 from cyberdrop_dl.data_structures.url_objects import AbsoluteHttpURL
 from cyberdrop_dl.exceptions import DDOSGuardError, DownloadError, InvalidContentTypeError, SlowDownloadError
+from cyberdrop_dl.utils import aio
 from cyberdrop_dl.utils.dates import parse_http_date
 from cyberdrop_dl.utils.logger import log, log_debug
 from cyberdrop_dl.utils.utilities import get_size_or_none
@@ -100,7 +101,7 @@ class DownloadClient:
             media_item.partial_file = download_dir / f"{downloaded_filename}.part"
 
         resume_point = 0
-        if media_item.partial_file and (size := await asyncio.to_thread(get_size_or_none, media_item.partial_file)):
+        if media_item.partial_file and (size := await aio.get_size(media_item.partial_file)):
             resume_point = size
             download_headers["Range"] = f"bytes={size}-"
 
@@ -108,7 +109,7 @@ class DownloadClient:
 
         async def process_response(resp: aiohttp.ClientResponse) -> bool:
             if resp.status == HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE:
-                await asyncio.to_thread(media_item.partial_file.unlink)
+                await aio.unlink(media_item.partial_file)
 
             await self.client_manager.check_http_status(resp, download=True)
 
@@ -133,7 +134,7 @@ class DownloadClient:
                     return False
 
             if resp.status != HTTPStatus.PARTIAL_CONTENT:
-                await asyncio.to_thread(media_item.partial_file.unlink, missing_ok=True)
+                await aio.unlink(media_item.partial_file, missing_ok=True)
 
             if not media_item.datetime and (last_modified := get_last_modified(resp.headers)):
                 msg = f"Unable to parse upload date for {media_item.url}, using `Last-Modified` header as file datetime"
@@ -271,13 +272,13 @@ class DownloadClient:
             downloaded = await self._download(domain, media_item)
 
         if downloaded:
-            await asyncio.to_thread(media_item.partial_file.rename, media_item.complete_file)
+            await aio.rename(media_item.partial_file, media_item.complete_file)
             if not media_item.is_segment:
                 proceed = self.client_manager.check_file_duration(media_item)
                 await self.manager.db_manager.history_table.add_duration(domain, media_item)
                 if not proceed:
                     log(f"Download Skip {media_item.url} due to runtime restrictions", 10)
-                    await asyncio.to_thread(media_item.complete_file.unlink)
+                    await aio.unlink(media_item.complete_file)
                     await self.mark_incomplete(media_item, domain)
                     self.manager.progress_manager.download_progress.add_skipped()
                     return False
@@ -304,7 +305,7 @@ class DownloadClient:
     async def add_file_size(self, domain: str, media_item: MediaItem) -> None:
         if not media_item.complete_file:
             media_item.complete_file = self.get_file_location(media_item)
-        if await asyncio.to_thread(media_item.complete_file.is_file):
+        if await aio.is_file(media_item.complete_file):
             await self.manager.db_manager.history_table.add_filesize(domain, media_item)
 
     async def handle_media_item_completion(self, media_item: MediaItem, downloaded: bool = False) -> None:

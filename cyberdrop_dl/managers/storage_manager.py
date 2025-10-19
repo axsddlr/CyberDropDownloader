@@ -14,6 +14,7 @@ import psutil
 from pydantic import ByteSize
 
 from cyberdrop_dl.exceptions import InsufficientFreeSpaceError
+from cyberdrop_dl.utils import aio
 from cyberdrop_dl.utils.logger import log, log_debug
 
 if TYPE_CHECKING:
@@ -238,7 +239,7 @@ class StorageManager:
                 log_debug(msg)
 
                 try:
-                    is_dir = await asyncio.to_thread(folder_drive.is_dir)
+                    is_dir = await aio.is_dir(folder_drive)
                 except OSError:
                     is_dir = False
                 if is_dir:
