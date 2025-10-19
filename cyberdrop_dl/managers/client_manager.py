@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ssl
+import threading
 import time
 import weakref
 from base64 import b64encode
@@ -198,7 +199,7 @@ class ClientManager:
 
         # Crawler error tracking with thread-safe access
         self._crawler_errors: dict[str, int] = defaultdict(int)
-        self._crawler_errors_lock = asyncio.Lock()
+        self._crawler_errors_lock = threading.Lock()
 
         # Session pooling for memory optimization
         self._shared_download_sessions: dict[str, aiohttp.ClientSession] = {}
@@ -505,23 +506,24 @@ class ClientManager:
         conn._resolver_owner = True
         return conn
 
-    async def increment_crawler_error(self, domain: str) -> None:
+    def increment_crawler_error(self, domain: str) -> None:
         """Thread-safe increment of crawler error count for a domain."""
-        async with self._crawler_errors_lock:
+        with self._crawler_errors_lock:
             self._crawler_errors[domain] += 1
 
-    async def get_crawler_error_count(self, domain: str) -> int:
+    def get_crawler_error_count(self, domain: str) -> int:
         """Thread-safe retrieval of crawler error count for a domain."""
-        async with self._crawler_errors_lock:
+        with self._crawler_errors_lock:
             return self._crawler_errors[domain]
 
-    async def reset_crawler_errors(self, domain: str) -> None:
+    def reset_crawler_errors(self, domain: str) -> None:
         """Thread-safe reset of crawler error count for a domain."""
-        async with self._crawler_errors_lock:
+        with self._crawler_errors_lock:
             self._crawler_errors[domain] = 0
 
-    async def check_domain_errors(self, domain: str) -> None:
-        error_count = await self.get_crawler_error_count(domain)
+    def check_domain_errors(self, domain: str) -> None:
+        """Check if domain has exceeded error threshold (synchronous, thread-safe)."""
+        error_count = self.get_crawler_error_count(domain)
         if error_count >= env.MAX_CRAWLER_ERRORS:
             if crawler := self.manager.scrape_mapper.disable_crawler(domain):
                 msg = (
@@ -533,15 +535,15 @@ class ClientManager:
 
     @contextlib.asynccontextmanager
     async def request_context(self, domain: str) -> AsyncGenerator[None]:
-        await self.check_domain_errors(domain)
+        self.check_domain_errors(domain)
         try:
             yield
         except DDOSGuardError:
-            await self.increment_crawler_error(domain)
+            self.increment_crawler_error(domain)
             raise
         else:
             # we could potentially reset the counter here
-            # await self.reset_crawler_errors(domain)
+            # self.reset_crawler_errors(domain)
             pass
         finally:
             pass
