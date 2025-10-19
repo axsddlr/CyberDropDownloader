@@ -234,15 +234,50 @@ class ClientManager:
         return self
 
     async def __aexit__(self, *args) -> None:
-        await self._session.close()
-        await self.reddit_session.close()
-        await self._download_session.close()
-        if _curl_import_error is not None:
-            return
+        errors = []
+
+        # Close scraper session
         try:
-            await self._curl_session.close()
-        except Exception:
-            pass
+            await self._session.close()
+            log_debug("Scraper session closed successfully", 10)
+        except Exception as e:
+            error_msg = f"Failed to close scraper session: {type(e).__name__}: {e}"
+            log(error_msg, 40)
+            errors.append(error_msg)
+
+        # Close reddit session
+        try:
+            await self.reddit_session.close()
+            log_debug("Reddit session closed successfully", 10)
+        except Exception as e:
+            error_msg = f"Failed to close reddit session: {type(e).__name__}: {e}"
+            log(error_msg, 40)
+            errors.append(error_msg)
+
+        # Close download session
+        try:
+            await self._download_session.close()
+            log_debug("Download session closed successfully", 10)
+        except Exception as e:
+            error_msg = f"Failed to close download session: {type(e).__name__}: {e}"
+            log(error_msg, 40)
+            errors.append(error_msg)
+
+        # Close curl session
+        if _curl_import_error is None:
+            try:
+                await self._curl_session.close()
+                log_debug("Curl session closed successfully", 10)
+            except Exception as e:
+                error_msg = f"Failed to close curl session: {type(e).__name__}: {e}"
+                log(error_msg, 40)
+                errors.append(error_msg)
+
+        # Report summary
+        if errors:
+            log(f"ClientManager __aexit__ completed with {len(errors)} error(s)", 40)
+        else:
+            log_debug("ClientManager __aexit__ completed cleanly", 10)
 
     @property
     def rate_limiting_options(self):
@@ -656,8 +691,32 @@ class ClientManager:
         return min_audio_duration <= media_item.duration <= max_audio_duration
 
     async def close(self) -> None:
-        await self.close_all_sessions()  # Clean up session pools
-        await self.flaresolverr.close()
+        """Close all client resources with proper error handling."""
+        errors = []
+
+        # Close session pools
+        try:
+            await self.close_all_sessions()
+            log_debug("Session pools closed successfully", 10)
+        except Exception as e:
+            error_msg = f"Failed to close session pools: {type(e).__name__}: {e}"
+            log(error_msg, 40)
+            errors.append(error_msg)
+
+        # Close FlareSolverr
+        try:
+            await self.flaresolverr.close()
+            log_debug("FlareSolverr closed successfully", 10)
+        except Exception as e:
+            error_msg = f"Failed to close FlareSolverr: {type(e).__name__}: {e}"
+            log(error_msg, 40)
+            errors.append(error_msg)
+
+        # Report summary
+        if errors:
+            log(f"ClientManager.close() completed with {len(errors)} error(s)", 40)
+        else:
+            log_debug("ClientManager.close() completed cleanly", 10)
 
 
 async def _set_dns_resolver(loop: asyncio.AbstractEventLoop | None = None) -> None:

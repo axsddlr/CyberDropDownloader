@@ -90,6 +90,8 @@ class CacheManager:
         if not isinstance(self.request_cache, Field):
             try:
                 await self.request_cache.close()
-            except Exception:
-                pass
+            except Exception as e:
+                from cyberdrop_dl.utils.logger import log
+                error_msg = f"Failed to close request cache: {type(e).__name__}: {e}"
+                log(error_msg, 40)
         self.save("version", current_version)

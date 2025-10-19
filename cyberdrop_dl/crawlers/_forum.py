@@ -605,16 +605,18 @@ class HTMLMessageBoardCrawler(MessageBoardCrawler, is_abc=True):
         try:
             if link_str := css.get_attr(link_obj, self.SELECTORS.posts.links.element):
                 return self.is_attachment(link_str)
-        except Exception:
-            pass
+        except Exception as e:
+            self.log(f"Failed to check if link is attachment: {type(e).__name__}: {e}", 10)
         return False
 
 
 def iter_links(links: Iterable[Tag], attribute: str) -> Iterable[str]:
+    from cyberdrop_dl.utils.logger import log_debug
     for link_tag in links:
         try:
             yield css.get_attr(link_tag, attribute)
-        except Exception:
+        except Exception as e:
+            log_debug(f"Failed to get attribute '{attribute}' from link tag: {type(e).__name__}: {e}", 10)
             continue
 
 

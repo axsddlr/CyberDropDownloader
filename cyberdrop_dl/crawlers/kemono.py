@@ -422,8 +422,9 @@ class KemonoBaseCrawler(Crawler, is_abc=True):
                 seen.add(link)
                 try:
                     url = self.parse_url(link)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.log(f"Failed to parse URL '{link}': {type(e).__name__}: {e}", 10)
+                    continue
                 else:
                     if self.DOMAIN not in url.host:
                         yield url
