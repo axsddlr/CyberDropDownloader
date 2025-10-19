@@ -46,16 +46,16 @@ class HashTable:
             filename = path.name
 
             # Check if the file exists with matching folder, filename, and size
-            cursor = await self.db_conn.execute(query, (folder, filename, hash_type))
-            if row := await cursor.fetchone():
-                return row[0]
+            result = await self._database.execute_read_query(query, (folder, filename, hash_type))
+            if result:
+                return result[0][0]
 
         except Exception as e:
             log(f"Error checking file: {e}", 40, exc_info=e)
 
     async def get_files_with_hash_matches(
         self, hash_value: str, size: int, hash_type: str | None = None
-    ) -> list[aiosqlite.Row]:
+    ) -> list[tuple]:
         """Retrieves a list of (folder, filename) tuples based on a given hash.
 
         Args:
@@ -80,8 +80,8 @@ class HashTable:
             """
 
         try:
-            cursor = await self.db_conn.execute(query, (hash_value, size, hash_type))
-            return cast("list[aiosqlite.Row]", await cursor.fetchall())
+            result = await self._database.execute_read_query(query, (hash_value, size, hash_type))
+            return result
 
         except Exception as e:
             log(f"Error retrieving folder and filename: {e}", 40, exc_info=e)
@@ -92,9 +92,8 @@ class HashTable:
             return False
 
         query = "SELECT 1 FROM hash WHERE hash.hash_type = ? AND hash.hash = ? LIMIT 1"
-        cursor = await self.db_conn.execute(query, (hash_type, hash_value))
-        result = await cursor.fetchone()
-        return result is not None
+        result = await self._database.execute_read_query(query, (hash_type, hash_value))
+        return len(result) > 0
 
     async def insert_or_update_hash_db(
         self, hash_value: str, hash_type: str, file: Path | str, original_filename: str | None, referer: URL | None
@@ -128,8 +127,7 @@ class HashTable:
                 full_path = full_path.absolute()
             download_filename = full_path.name
             folder = str(full_path.parent)
-            await self.db_conn.execute(query, (hash_value, hash_type, folder, download_filename, hash_value))
-            await self.db_conn.commit()
+            await self._database.execute_write_query(query, (hash_value, hash_type, folder, download_filename, hash_value))
         except Exception as e:
             log(f"Error inserting/updating record: {e}", 40, exc_info=e)
             return False
@@ -153,7 +151,7 @@ class HashTable:
             stat = full_path.stat()
             file_size = stat.st_size
             file_date = int(stat.st_mtime)
-            await self.db_conn.execute(
+            await self._database.execute_write_query(
                 query,
                 (
                     folder,
@@ -168,7 +166,6 @@ class HashTable:
                     file_date,
                 ),
             )
-            await self.db_conn.commit()
         except Exception as e:
             log(f"Error inserting/updating record: {e}", 40, exc_info=e)
             return False
@@ -190,8 +187,7 @@ class HashTable:
         else:
             query, params = "SELECT DISTINCT hash FROM hash", ()
         try:
-            cursor = await self.db_conn.execute(query, params)
-            rows = await cursor.fetchall()
+            rows = await self._database.execute_read_query(query, params)
             return [row[0] for row in rows]
         except Exception as e:
             log(f"Error retrieving folder and filename: {e}", 40, exc_info=e)
