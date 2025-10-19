@@ -167,6 +167,9 @@ class DownloadClient:
         await self.manager.states.RUNNING.wait()
         fallback_url_generator = _fallback_generator(media_item)
         fallback_count = 0
+        connection_retry_count = 0
+        max_connection_retries = 3
+
         while True:
             resp = None
             try:
@@ -174,6 +177,15 @@ class DownloadClient:
                 async with self.client_manager.get_download_session(domain) as session:
                     async with session.get(download_url, headers=download_headers) as resp:
                         return await process_response(resp)
+            except RuntimeError as e:
+                # Handle connection closed errors from stale pooled connections
+                if "connection closed" in str(e).lower() and connection_retry_count < max_connection_retries:
+                    connection_retry_count += 1
+                    log(f"Connection closed during download of {media_item.url}, retrying ({connection_retry_count}/{max_connection_retries})", 30)
+                    await asyncio.sleep(0.5 * connection_retry_count)  # Exponential backoff
+                    continue
+                # Re-raise if not connection error or max retries exceeded
+                raise
             except (DownloadError, DDOSGuardError):
                 if resp is None:
                     raise
@@ -193,6 +205,8 @@ class DownloadClient:
                         msg = f" with fallback URL #{fallback_count} {download_url} failed, retrying with new fallback URL: "
                     log(f"Download of {media_item.url}{msg}{next_download_url}", 40)
                     download_url = next_download_url
+                    # Reset connection retry count when trying fallback URL
+                    connection_retry_count = 0
                     continue
                 raise
 
